@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8" />
+  <title>terrain-analysis blend-mode test</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- <script src="../dist/maplibre-gl-dev.js"></script>
+  <link rel="stylesheet" href="../dist/maplibre-gl.css" /> -->
+  <script src="https://unpkg.com/@eslopemap/maplibre-gl@5.21.9/dist/maplibre-gl.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/@eslopemap/maplibre-gl@5.21.9/dist/maplibre-gl.css" />
+  <style>html, body, #map { margin: 0; width: 100%; height: 100%; }
+    #info { position: absolute; top: 10px; left: 10px; z-index: 10; background: #fff; padding: 8px 12px; border-radius: 6px; font: 13px/1.5 system-ui; box-shadow: 0 1px 4px rgba(0,0,0,.3); max-width: 560px; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    #result { font-weight: bold; font-size: 14px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">
+    <b><code>3D terrain-analysis</code> with vector basemap<br/></b>
+    <label><input type="radio" name="blend" value="multiply" checked> <code>blend-mode: 'multiply'</code></label><br>
+    <label><input type="radio" name="blend" value="soft-multiply"> <code>blend-mode: 'soft-multiply'</code></label><br>
+    <label><input type="radio" name="blend" value="screen"> <code>blend-mode: 'screen'</code></label><br>
+    <label><input type="radio" name="blend" value="normal"> <code>blend-mode: 'normal'</code></label><br>
+    <label><input type="checkbox" id="toggle3d" checked> 3D terrain</label><br>
+    <label>
+      Opacity
+      <input type="range" id="opacity" min="0" max="1" step="0.05" value="0.45">
+      <span id="opacity-value">0.45</span>
+    </label><br>
+
+  </div>
+  <script>
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      center: [7.1, 46.1],
+      zoom: 12,
+      pitch: 60,
+      style: 'https://vectortiles.geo.admin.ch/styles/ch.swisstopo.basemap.vt/style.json'
+    });
+
+    map.on('load', () => {
+      map.addSource('dem', {
+          type: 'raster-dem',
+          tiles: ['https://tiles.mapterhorn.com/{z}/{x}/{y}.webp'],
+          tileSize: 512,
+          maxzoom: 15,
+          encoding: 'terrarium'
+      });
+
+      map.addSource('3d-dem', {
+          type: 'raster-dem',
+          tiles: ['https://tiles.mapterhorn.com/{z}/{x}/{y}.webp'],
+          tileSize: 512,
+          maxzoom: 12,
+          encoding: 'terrarium'
+      });
+
+      map.addLayer({
+          id: 'analysis',
+          type: 'terrain-analysis',
+          source: 'dem',
+          paint: {
+            'attribute': 'slope',
+            'opacity': 0.45,
+            'color': [
+              'step', ['slope'],
+              '#ffffff', 20, '#c0ffff', 24, '#57ffff', 28, '#00d3db',
+              31, '#fffa32', 34, '#ffc256', 37, '#fd7100', 40, '#ff0000',
+              43, '#e958ff', 47, '#a650ff', 52, '#5e1eff', 57, '#0000ff', 65, '#aaaaaa'
+            ]
+          }
+      });
+
+      applyControls();
+      map.once('idle', applyControls);
+    });
+
+    function applyControls() {
+      if (!map || !map.isStyleLoaded() || !map.getLayer('analysis')) {
+        return;
+      }
+
+      const blendMode = document.querySelector('input[name="blend"]:checked').value;
+      const is3d = document.getElementById('toggle3d').checked;
+      const opacity = Number(document.getElementById('opacity').value);
+
+      map.setPaintProperty('analysis', 'blend-mode', blendMode);
+      map.setPaintProperty('analysis', 'opacity', opacity);
+      document.getElementById('opacity-value').textContent = opacity.toFixed(2);
+
+      if (is3d) {
+        map.setTerrain({ source: '3d-dem', exaggeration: 1.4 });
+      } else {
+        map.setTerrain(null);
+      }
+
+    }
+
+    map.on('error', e => console.error('Map error:', e.error ? e.error.message : e));
+
+    document.querySelectorAll('input[name="blend"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        applyControls();
+      });
+    });
+
+    document.getElementById('toggle3d').addEventListener('change', () => {
+      applyControls();
+    });
+
+    document.getElementById('opacity').addEventListener('input', () => {
+      applyControls();
+    });
+  </script>
+</body></html>

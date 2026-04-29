@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html><head>
+  <meta charset="utf-8" />
+  <title>Bisect: terrain-analysis multiply vs normal blend in 3D</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- <script src="../dist/maplibre-gl-dev.js"></script>
+  <link rel="stylesheet" href="../dist/maplibre-gl.css" /> -->
+  <script src="https://unpkg.com/@eslopemap/maplibre-gl@5.21.2/dist/maplibre-gl.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/@eslopemap/maplibre-gl@5.21.2/dist/maplibre-gl.css" />
+  <style>html, body, #map { margin: 0; width: 100%; height: 100%; }
+    #info { position: absolute; top: 10px; left: 10px; z-index: 10; background: #fff; padding: 8px 12px; border-radius: 6px; font: 13px/1.5 system-ui; box-shadow: 0 1px 4px rgba(0,0,0,.3); max-width: 560px; }
+    code { background: #f0f0f0; padding: 1px 4px; border-radius: 3px; font-size: 12px; }
+    #result { font-weight: bold; font-size: 14px; margin-top: 6px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="info">
+    <b>Bisect: <code>terrain-analysis</code> blend-mode in 3D with 30 intervening layers</b>
+    <p>
+      Same setup as bisect-14: 30 dummy layers between hillshade and terrain-analysis, 3D on.<br>
+      Toggle <code>blend-mode</code> to confirm multiply is the cause.
+    </p>
+    <label><input type="radio" name="blend" value="multiply" checked> <code>blend-mode: 'multiply'</code> (should FAIL — invisible)</label><br>
+    <label><input type="radio" name="blend" value="screen"> <code>blend-mode: 'screen'</code> (should also FAIL — same issue)</label><br>
+    <label><input type="radio" name="blend" value="normal"> <code>blend-mode: 'normal'</code> (standard alpha — should PASS)</label><br>
+    <label><input type="checkbox" id="toggle3d" checked> 3D terrain</label><br>
+
+    <p id="result"></p>
+    <p id="status" style="margin:4px 0;font-size:12px;color:#666;"></p>
+  </div>
+  <script>
+    const DUMMY_LAYER_COUNT = 30;
+
+    function getBlendMode() {
+      return document.querySelector('input[name="blend"]:checked').value;
+    }
+
+    function createMap() {
+      const blendMode = getBlendMode();
+
+      return new maplibregl.Map({
+        container: 'map',
+        center: [6.8652, 45.8326],
+        zoom: 12,
+        style: {
+          version: 8,
+          sources: {
+            osm: {
+              type: 'raster',
+              tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+              tileSize: 256,
+              attribution: '&copy; OpenStreetMap contributors'
+            },
+            dem: {
+              type: 'raster-dem',
+              tiles: ['https://tiles.mapterhorn.com/{z}/{x}/{y}.webp'],
+              tileSize: 512,
+              maxzoom: 14,
+              encoding: 'terrarium'
+            }
+          },
+          layers: [
+            { id: 'basemap', type: 'raster', source: 'osm' },
+            { id: 'dem-loader', type: 'hillshade', source: 'dem',
+              paint: { 'hillshade-exaggeration': 0.10 } }
+          ]
+        }
+      });
+    }
+
+    let map = createMap();
+
+    function updateStatus() {
+      const layers = map.getStyle().layers;
+      const analysisIdx = layers.findIndex(l => l.id === 'analysis');
+      const hillshadeIdx = layers.findIndex(l => l.id === 'dem-loader');
+      const gap = analysisIdx > 0 ? analysisIdx - hillshadeIdx - 1 : 0;
+      const terrain = map.getTerrain();
+      const blendMode = getBlendMode();
+      document.getElementById('status').textContent =
+        `Layers: ${layers.length} | Gap: ${gap} | 3D: ${terrain ? 'ON' : 'OFF'} | blend: ${blendMode}`;
+      document.getElementById('result').textContent =
+        blendMode === 'normal'
+          ? 'Expected: VISIBLE (normal alpha blending works against cleared FBO)'
+          : `Expected: INVISIBLE (${blendMode} against cleared FBO = zero)`;
+      document.getElementById('result').style.color =
+        blendMode === 'normal' ? 'green' : 'red';
+    }
+
+    map.on('load', () => {
+      const blendMode = getBlendMode();
+
+      // 3D terrain
+      map.setLayoutProperty('dem-loader', 'visibility', 'none');
+      const is3d = document.getElementById('toggle3d').checked;
+      if (is3d) {
+        map.setTerrain({ source: 'dem', exaggeration: 1.4 });
+      }
+
+      // 30 dummy layers (alternating line/circle to break stacking)
+      for (let i = 0; i < DUMMY_LAYER_COUNT; i++) {
+        map.addSource(`dummy-src-${i}`, {
+          type: 'geojson',
+          data: { type: 'FeatureCollection', features: [] }
+        });
+        map.addLayer({
+          id: `dummy-layer-${i}`,
+          type: i % 2 === 0 ? 'line' : 'circle',
+          source: `dummy-src-${i}`,
+          paint: i % 2 === 0
+            ? { 'line-color': '#e040fb', 'line-width': 3 }
+            : { 'circle-radius': 4, 'circle-color': '#e040fb' }
+        });
+      }
+
+      // terrain-analysis with selected blend mode
+      const paint = {
+        'attribute': 'slope',
+        'opacity': 0.45,
+        'color': [
+          'step', ['slope'],
+          '#ffffff', 20, '#c0ffff', 24, '#57ffff', 28, '#00d3db',
+          31, '#fffa32', 34, '#ffc256', 37, '#fd7100', 40, '#ff0000',
+          43, '#e958ff', 47, '#a650ff', 52, '#5e1eff', 57, '#0000ff', 65, '#aaaaaa'
+        ]
+      };
+      if (blendMode !== 'normal') {
+        paint['blend-mode'] = blendMode;
+      }
+
+      map.addLayer({
+        id: 'analysis',
+        type: 'terrain-analysis',
+        source: 'dem',
+        paint
+      });
+
+      updateStatus();
+    });
+
+    // Reload map on blend mode change
+    document.querySelectorAll('input[name="blend"]').forEach(radio => {
+      radio.addEventListener('change', () => {
+        const container = document.getElementById('map');
+        map.remove();
+        container.innerHTML = '';
+        map = createMap();
+        map.on('load', () => {
+          const blendMode = getBlendMode();
+          map.setLayoutProperty('dem-loader', 'visibility', 'none');
+          const is3d = document.getElementById('toggle3d').checked;
+          if (is3d) {
+            map.setTerrain({ source: 'dem', exaggeration: 1.4 });
+          }
+          for (let i = 0; i < DUMMY_LAYER_COUNT; i++) {
+            map.addSource(`dummy-src-${i}`, {
+              type: 'geojson',
+              data: { type: 'FeatureCollection', features: [] }
+            });
+            map.addLayer({
+              id: `dummy-layer-${i}`,
+              type: i % 2 === 0 ? 'line' : 'circle',
+              source: `dummy-src-${i}`,
+              paint: i % 2 === 0
+                ? { 'line-color': '#e040fb', 'line-width': 3 }
+                : { 'circle-radius': 4, 'circle-color': '#e040fb' }
+            });
+          }
+          const paint = {
+            'attribute': 'slope',
+            'opacity': 0.45,
+            'color': [
+              'step', ['slope'],
+              '#ffffff', 20, '#c0ffff', 24, '#57ffff', 28, '#00d3db',
+              31, '#fffa32', 34, '#ffc256', 37, '#fd7100', 40, '#ff0000',
+              43, '#e958ff', 47, '#a650ff', 52, '#5e1eff', 57, '#0000ff', 65, '#aaaaaa'
+            ]
+          };
+          if (blendMode !== 'normal') {
+            paint['blend-mode'] = blendMode;
+          }
+          map.addLayer({ id: 'analysis', type: 'terrain-analysis', source: 'dem', paint });
+          updateStatus();
+        });
+      });
+    });
+
+    map.on('error', e => console.error('Map error:', e.error ? e.error.message : e));
+  </script>
+</body></html>

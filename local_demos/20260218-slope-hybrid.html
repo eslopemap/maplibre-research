@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Hybrid DEM Slope / Aspect Overlay (Internal Cache + Fallback) — MapLibre GL JS</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1,maximum-scale=1,user-scalable=no" />
+
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.18.0/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@5.18.0/dist/maplibre-gl.js"></script>
+
+  <style>
+    html, body, #map { margin: 0; width: 100%; height: 100%; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(255, 255, 255, 0.94);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+      min-width: 260px;
+      font-size: 13px;
+    }
+
+    #legend {
+      position: absolute;
+      left: 10px;
+      bottom: 20px;
+      z-index: 10;
+      background: rgba(255, 255, 255, 0.94);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+      min-width: 260px;
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .row { margin: 6px 0; }
+    .legend-title { font-weight: 700; margin-bottom: 6px; }
+    .ramp {
+      height: 12px;
+      border-radius: 4px;
+      border: 1px solid rgba(0,0,0,0.15);
+      margin: 6px 0 4px;
+    }
+    .labels { display: flex; justify-content: space-between; opacity: 0.85; }
+    #status { font-size: 12px; opacity: 0.85; }
+    #status code { background: rgba(0,0,0,0.05); padding: 1px 4px; border-radius: 3px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <div class="row">
+      <label for="mode"><strong>Mode</strong></label><br />
+      <select id="mode">
+        <option value="slope" selected>Slope</option>
+        <option value="aspect">Aspect</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="opacity"><strong>Opacity</strong>: <span id="opacityValue">0.35</span></label><br />
+      <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.35" />
+    </div>
+
+    <div id="status" class="row">
+      Internal DEM tiles used: <code id="internalCount">0</code><br />
+      Fallback fetch tiles used: <code id="fallbackCount">0</code>
+    </div>
+  </div>
+
+  <div id="legend">
+    <div id="legendTitle" class="legend-title">Slope (degrees)</div>
+    <div id="legendRamp" class="ramp"></div>
+    <div id="legendLabels" class="labels"></div>
+  </div>
+
+  <script>
+    const DEM_TILE_URL_TEMPLATE = 'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
+    const MAX_STEP_STOPS = 16;
+    const ANALYSIS_COLOR = {
+      slope: [
+        'step', ['slope'],
+        "#ffffff", // white
+        21, "#aaffff", // pale turquoise / celeste
+        25, "#56ffff", // cyan
+        28, "#fefe50", // titanium yellow before 8
+        31, "#f5bf00", // golden poppy   befor 61
+        34, "#ff9b00", // orange peel  was 40.3  7
+        37, "#ff6900", // dark orange 2 was 24
+        40, "#ff0000", // red
+        43, "#dc00f5", // magenta 2  299.5  53.8
+        46, "#a719ff", // purple    282    47
+        49, "#6e00ff", // electric indigo / violet
+        52, "#4106ff", // blue1
+        55, "#0000ff", // blue
+        58, "#595959", // gray 30
+      ],
+      aspect: [
+        'step', ['aspect'],
+        '#ff0000',
+        45, '#ffff00',
+        135, '#00ff00',
+        225, '#00ffff',
+        315, '#0000ff'
+      ]
+    };
+
+    const ANALYSIS_RANGE = {
+      slope: [0, 90],
+      aspect: [0, 360]
+    };
+
+    const colorCanvas = document.createElement('canvas');
+    colorCanvas.width = 1;
+    colorCanvas.height = 1;
+    const colorCtx = colorCanvas.getContext('2d', {willReadFrequently: true});
+
+    function demTileUrl(z, x, y) {
+      return DEM_TILE_URL_TEMPLATE
+        .replace('{z}', String(z))
+        .replace('{x}', String(x))
+        .replace('{y}', String(y));
+    }
+
+    function cssColorToRgb01(color) {
+      colorCtx.clearRect(0, 0, 1, 1);
+      colorCtx.fillStyle = '#000000';
+      colorCtx.fillStyle = color;
+      colorCtx.fillRect(0, 0, 1, 1);
+      const pixel = colorCtx.getImageData(0, 0, 1, 1).data;
+      return [pixel[0] / 255, pixel[1] / 255, pixel[2] / 255];
+    }
+
+    function parseStepRamp(expression, expectedInput) {
+      if (!Array.isArray(expression) || expression[0] !== 'step') {
+        throw new Error('Color expression must be a step expression');
+      }
+
+      const input = expression[1];
+      if (!Array.isArray(input) || input[0] !== expectedInput) {
+        throw new Error(`Step input must be ["${expectedInput}"]`);
+      }
+
+      const defaultColor = expression[2];
+      const stepCount = Math.floor((expression.length - 3) / 2);
+      if (stepCount > MAX_STEP_STOPS) {
+        throw new Error(`Too many step stops. Max supported is ${MAX_STEP_STOPS}`);
+      }
+
+      const values = new Float32Array(MAX_STEP_STOPS);
+      const colors = new Float32Array((MAX_STEP_STOPS + 1) * 3);
+
+      const c0 = cssColorToRgb01(defaultColor);
+      colors[0] = c0[0];
+      colors[1] = c0[1];
+      colors[2] = c0[2];
+
+      for (let i = 0; i < stepCount; i++) {
+        values[i] = Number(expression[3 + i * 2]);
+        const c = cssColorToRgb01(expression[4 + i * 2]);
+        colors[(i + 1) * 3 + 0] = c[0];
+        colors[(i + 1) * 3 + 1] = c[1];
+        colors[(i + 1) * 3 + 2] = c[2];
+      }
+
+      return {stepCount, values, colors};
+    }
+
+    const PARSED_RAMPS = {
+      slope: parseStepRamp(ANALYSIS_COLOR.slope, 'slope'),
+      aspect: parseStepRamp(ANALYSIS_COLOR.aspect, 'aspect')
+    };
+
+    function rampToLegendCss(mode) {
+      const ramp = PARSED_RAMPS[mode];
+      const range = ANALYSIS_RANGE[mode];
+      const min = range[0];
+      const max = range[1];
+      const parts = [];
+
+      for (let i = 0; i <= ramp.stepCount; i++) {
+        const r = Math.round(ramp.colors[i * 3 + 0] * 255);
+        const g = Math.round(ramp.colors[i * 3 + 1] * 255);
+        const b = Math.round(ramp.colors[i * 3 + 2] * 255);
+        let percent = 0;
+        if (i === 0) {
+          percent = 0;
+        } else {
+          percent = Math.max(0, Math.min(100, ((ramp.values[i - 1] - min) / (max - min)) * 100));
+        }
+        parts.push(`rgb(${r}, ${g}, ${b}) ${percent.toFixed(2)}%`);
+      }
+
+      return `linear-gradient(to right, ${parts.join(', ')})`;
+    }
+
+    // Hybrid strategy:
+    // 1) Ask MapLibre internals for already loaded raster-dem tiles (best case, no duplicate download).
+    // 2) If internal tile is unavailable, fallback to direct network fetch for that tile.
+    //
+    // Note: step (1) depends on private internals and can break across versions.
+
+    const DEM_SOURCE_ID = 'dem';
+    const DEM_MAX_Z = 14;
+    const TILE_SIZE = 512;
+
+    const state = {
+      mode: 'slope',
+      opacity: 0.35,
+      internalCount: 0,
+      fallbackCount: 0
+    };
+
+    function updateStatus() {
+      document.getElementById('internalCount').textContent = String(state.internalCount);
+      document.getElementById('fallbackCount').textContent = String(state.fallbackCount);
+    }
+
+    function updateLegend() {
+      const title = document.getElementById('legendTitle');
+      const ramp = document.getElementById('legendRamp');
+      const labels = document.getElementById('legendLabels');
+
+      if (state.mode === 'slope') {
+        title.textContent = 'Slope (degrees)';
+        ramp.style.background = rampToLegendCss('slope');
+        labels.innerHTML = '<span>0°</span><span>15°</span><span>30°</span><span>45°</span><span>90°</span>';
+      } else {
+        title.textContent = 'Aspect (compass direction)';
+        ramp.style.background = rampToLegendCss('aspect');
+        labels.innerHTML = '<span>N</span><span>E</span><span>S</span><span>W</span><span>N</span>';
+      }
+    }
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      center: [6.8652, 45.8326],
+      zoom: 12,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 512,
+            attribution: '&copy; OpenStreetMap contributors'
+          },
+          // Internal raster-dem source used by the hybrid custom layer.
+          dem: {
+            type: 'raster-dem',
+            url: 'https://tiles.mapterhorn.com/tilejson.json',
+          }
+        },
+        layers: [
+          {id: 'osm', type: 'raster', source: 'osm', paint: {'raster-opacity': 1}},
+          {
+            // Tiny hillshade to force MapLibre to keep DEM source active and loaded.
+            // If you remove this, source may be unused and internal cache can be empty.
+            id: 'dem-loader',
+            type: 'hillshade',
+            source: DEM_SOURCE_ID,
+            paint: {
+              'hillshade-exaggeration': 0.01,
+              'hillshade-shadow-color': 'rgba(0,0,0,0)',
+              'hillshade-highlight-color': 'rgba(255,255,255,0)',
+              'hillshade-accent-color': 'rgba(0,0,0,0)'
+            }
+          }
+        ]
+      },
+      canvasContextAttributes: {antialias: true}
+    });
+
+    document.getElementById('mode').addEventListener('change', (e) => {
+      state.mode = e.target.value;
+      updateLegend();
+      map.triggerRepaint();
+    });
+
+    document.getElementById('opacity').addEventListener('input', (e) => {
+      state.opacity = Number(e.target.value);
+      document.getElementById('opacityValue').textContent = state.opacity.toFixed(2);
+      map.triggerRepaint();
+    });
+
+    updateLegend();
+    updateStatus();
+
+    function normalizeTileX(x, z) {
+      const n = Math.pow(2, z);
+      return ((x % n) + n) % n;
+    }
+
+    function lonLatToTile(lon, lat, z) {
+      const n = Math.pow(2, z);
+      const x = Math.floor((lon + 180) / 360 * n);
+      const latRad = lat * Math.PI / 180;
+      const y = Math.floor((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2 * n);
+      return {x, y};
+    }
+
+    function tileLatCenter(y, z) {
+      const n = Math.pow(2, z);
+      const northRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+      const southRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
+      const north = northRad * 180 / Math.PI;
+      const south = southRad * 180 / Math.PI;
+      return (north + south) * 0.5;
+    }
+
+    function mercatorVertsForTile(z, x, y, wrap) {
+      const n = Math.pow(2, z);
+      const x0 = x / n + wrap;
+      const x1 = (x + 1) / n + wrap;
+      const y0 = y / n;
+      const y1 = (y + 1) / n;
+      return new Float32Array([
+        x0, y0, 0, 0,
+        x0, y1, 0, 1,
+        x1, y0, 1, 0,
+        x1, y1, 1, 1
+      ]);
+    }
+
+    function createHybridLayer() {
+      return {
+        id: 'dem-analysis-hybrid',
+        type: 'custom',
+        renderingMode: '2d',
+
+        map: null,
+        program: null,
+        buffer: null,
+        uMatrix: null,
+        uDem: null,
+        uOpacity: null,
+        uMode: null,
+        uZoom: null,
+        uLat: null,
+        uTexel: null,
+        aPos: -1,
+        aUv: -1,
+
+        // Fallback textures loaded directly from network only when internal cache is missing.
+        fallbackTextures: new Map(),
+        fallbackInFlight: new Set(),
+
+        onAdd(map, gl) {
+          this.map = map;
+
+          const vertexSource = `
+            precision highp float;
+            uniform mat4 u_matrix;
+            attribute vec2 a_pos;
+            attribute vec2 a_uv;
+            varying vec2 v_uv;
+            void main() {
+              v_uv = a_uv;
+              gl_Position = u_matrix * vec4(a_pos, 0.0, 1.0);
+            }
+          `;
+
+          const fragmentSource = `
+            precision highp float;
+            uniform sampler2D u_dem;
+            uniform float u_opacity;
+            uniform int u_mode;
+            uniform float u_zoom;
+            uniform float u_lat;
+            uniform vec2 u_texel;
+            uniform int u_step_count;
+            uniform float u_step_values[${MAX_STEP_STOPS}];
+            uniform vec3 u_step_colors[${MAX_STEP_STOPS + 1}];
+            varying vec2 v_uv;
+
+            float decodeTerrarium(vec4 c) {
+              float r = c.r * 255.0;
+              float g = c.g * 255.0;
+              float b = c.b * 255.0;
+              return (r * 256.0 + g + b / 256.0) - 32768.0;
+            }
+
+            float elevationAt(vec2 uv) {
+              return decodeTerrarium(texture2D(u_dem, clamp(uv, vec2(0.0), vec2(1.0))));
+            }
+
+            vec2 hornDeriv(vec2 uv) {
+              vec2 e = u_texel;
+
+              float a = elevationAt(uv + vec2(-e.x, -e.y));
+              float b = elevationAt(uv + vec2(0.0, -e.y));
+              float c = elevationAt(uv + vec2(e.x, -e.y));
+              float d = elevationAt(uv + vec2(-e.x, 0.0));
+              float f = elevationAt(uv + vec2(e.x, 0.0));
+              float g = elevationAt(uv + vec2(-e.x, e.y));
+              float h = elevationAt(uv + vec2(0.0, e.y));
+              float i = elevationAt(uv + vec2(e.x, e.y));
+
+              float dzdx = (c + 2.0 * f + i) - (a + 2.0 * d + g);
+              float dzdy = (g + 2.0 * h + i) - (a + 2.0 * b + c);
+
+              float tileSize = 510.0;
+              vec2 deriv = vec2(dzdx, dzdy) * tileSize / pow(2.0, 28.2562 - u_zoom);
+              deriv.x = deriv.x / max(cos(radians(u_lat)), 0.0001);
+              return deriv;
+            }
+
+            vec3 colorFromStep(float value) {
+              vec3 color = u_step_colors[0];
+              for (int i = 0; i < ${MAX_STEP_STOPS}; i++) {
+                if (i >= u_step_count) break;
+                if (value >= u_step_values[i]) {
+                  color = u_step_colors[i + 1];
+                }
+              }
+              return color;
+            }
+
+            void main() {
+              vec2 d = hornDeriv(v_uv);
+              float gradient = length(d);
+              float slopeDeg = clamp(degrees(atan(gradient)), 0.0, 90.0);
+
+              float aspectDeg = degrees(atan(d.y, -d.x));
+              aspectDeg = mod(90.0 - aspectDeg, 360.0);
+              if (gradient < 0.0001) aspectDeg = 0.0;
+
+              float scalar = (u_mode == 0) ? slopeDeg : aspectDeg;
+              vec3 color = colorFromStep(scalar);
+              gl_FragColor = vec4(color * u_opacity, u_opacity);
+            }
+          `;
+
+          function compile(gl, type, source) {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+              throw new Error(gl.getShaderInfoLog(shader) || 'Shader compile failed');
+            }
+            return shader;
+          }
+
+          const vs = compile(gl, gl.VERTEX_SHADER, vertexSource);
+          const fs = compile(gl, gl.FRAGMENT_SHADER, fragmentSource);
+
+          this.program = gl.createProgram();
+          gl.attachShader(this.program, vs);
+          gl.attachShader(this.program, fs);
+          gl.linkProgram(this.program);
+          if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+            throw new Error(gl.getProgramInfoLog(this.program) || 'Program link failed');
+          }
+
+          this.aPos = gl.getAttribLocation(this.program, 'a_pos');
+          this.aUv = gl.getAttribLocation(this.program, 'a_uv');
+          this.uMatrix = gl.getUniformLocation(this.program, 'u_matrix');
+          this.uDem = gl.getUniformLocation(this.program, 'u_dem');
+          this.uOpacity = gl.getUniformLocation(this.program, 'u_opacity');
+          this.uMode = gl.getUniformLocation(this.program, 'u_mode');
+          this.uZoom = gl.getUniformLocation(this.program, 'u_zoom');
+          this.uLat = gl.getUniformLocation(this.program, 'u_lat');
+          this.uTexel = gl.getUniformLocation(this.program, 'u_texel');
+          this.uStepCount = gl.getUniformLocation(this.program, 'u_step_count');
+          this.uStepValues = gl.getUniformLocation(this.program, 'u_step_values');
+          this.uStepColors = gl.getUniformLocation(this.program, 'u_step_colors');
+
+          this.buffer = gl.createBuffer();
+        },
+
+        getDemTileManager() {
+          // Private API access (version-sensitive): map.style.tileManagers[DEM_SOURCE_ID]
+          const style = this.map && this.map.style;
+          if (!style || !style.tileManagers) return null;
+          return style.tileManagers[DEM_SOURCE_ID] || null;
+        },
+
+        getVisibleTileTriples() {
+          const z = Math.min(DEM_MAX_Z, Math.max(0, Math.floor(this.map.getZoom())));
+          const bounds = this.map.getBounds();
+          const north = bounds.getNorth();
+          const south = bounds.getSouth();
+          const west = bounds.getWest();
+          const east = bounds.getEast();
+
+          const lonRanges = (west <= east) ? [[west, east]] : [[west, 180], [-180, east]];
+          const out = [];
+
+          for (const range of lonRanges) {
+            const nw = lonLatToTile(range[0], north, z);
+            const se = lonLatToTile(range[1], south, z);
+
+            const xMin = Math.min(nw.x, se.x);
+            const xMax = Math.max(nw.x, se.x);
+            const yMin = Math.min(nw.y, se.y);
+            const yMax = Math.max(nw.y, se.y);
+
+            for (let y = yMin; y <= yMax; y++) {
+              if (y < 0 || y >= Math.pow(2, z)) continue;
+              for (let x = xMin; x <= xMax; x++) {
+                out.push({z, x: normalizeTileX(x, z), y, key: `${z}/${normalizeTileX(x, z)}/${y}`});
+              }
+            }
+          }
+
+          return out;
+        },
+
+        async ensureFallbackTexture(z, x, y, key, gl) {
+          if (this.fallbackTextures.has(key) || this.fallbackInFlight.has(key)) return;
+          this.fallbackInFlight.add(key);
+
+          try {
+            const mappedUrl = demTileUrl(z, x, y);
+            const response = await fetch(mappedUrl, {mode: 'cors', cache: 'force-cache'});
+            if (!response.ok) throw new Error(`DEM tile ${key}: HTTP ${response.status}`);
+
+            const blob = await response.blob();
+            const bitmap = await createImageBitmap(blob);
+
+            const texture = gl.createTexture();
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+            gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+
+            this.fallbackTextures.set(key, texture);
+            map.triggerRepaint();
+          } catch (err) {
+            console.error('Fallback DEM fetch failed:', key, err);
+          } finally {
+            this.fallbackInFlight.delete(key);
+          }
+        },
+
+        render(gl, args) {
+          state.internalCount = 0;
+          state.fallbackCount = 0;
+
+          gl.useProgram(this.program);
+          gl.uniformMatrix4fv(this.uMatrix, false, args.defaultProjectionData.mainMatrix);
+          gl.uniform1f(this.uOpacity, state.opacity);
+          gl.uniform1i(this.uMode, state.mode === 'slope' ? 0 : 1);
+          gl.uniform2f(this.uTexel, 1 / TILE_SIZE, 1 / TILE_SIZE);
+
+          const ramp = state.mode === 'slope' ? PARSED_RAMPS.slope : PARSED_RAMPS.aspect;
+          gl.uniform1i(this.uStepCount, ramp.stepCount);
+          gl.uniform1fv(this.uStepValues, ramp.values);
+          gl.uniform3fv(this.uStepColors, ramp.colors);
+
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+          gl.enableVertexAttribArray(this.aPos);
+          gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 16, 0);
+          gl.enableVertexAttribArray(this.aUv);
+          gl.vertexAttribPointer(this.aUv, 2, gl.FLOAT, false, 16, 8);
+
+          gl.enable(gl.BLEND);
+          gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+
+          const tileManager = this.getDemTileManager();
+          const visible = this.getVisibleTileTriples();
+
+          // Build quick index by canonical z/x/y for internal source tiles.
+          const internalByCanonical = new Map();
+          if (tileManager && tileManager.getRenderableIds && tileManager.getTileByID) {
+            const ids = tileManager.getRenderableIds();
+            for (const id of ids) {
+              const tile = tileManager.getTileByID(id);
+              if (!tile || !tile.tileID || !tile.tileID.canonical) continue;
+              const cz = tile.tileID.canonical.z;
+              const cx = tile.tileID.canonical.x;
+              const cy = tile.tileID.canonical.y;
+              const key = `${cz}/${cx}/${cy}`;
+              internalByCanonical.set(key, tile);
+            }
+          }
+
+          for (const v of visible) {
+            const canonicalKey = `${v.z}/${v.x}/${v.y}`;
+            const latCenter = tileLatCenter(v.y, v.z);
+
+            let texture = null;
+            let wrap = 0;
+
+            // Path A: internal cache tile exists.
+            const internalTile = internalByCanonical.get(canonicalKey);
+            if (internalTile) {
+              wrap = internalTile.tileID && typeof internalTile.tileID.wrap === 'number' ? internalTile.tileID.wrap : 0;
+
+              // Reuse existing GPU texture if present.
+              if (internalTile.demTexture && internalTile.demTexture.texture) {
+                texture = internalTile.demTexture.texture;
+              } else if (internalTile.dem && internalTile.dem.getPixels) {
+                // If only DEM pixels are present, upload once without network fetch.
+                const pixels = internalTile.dem.getPixels();
+                const t = gl.createTexture();
+                gl.bindTexture(gl.TEXTURE_2D, t);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+                gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+                gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+                gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, pixels.data || pixels);
+                texture = t;
+              }
+
+              if (texture) state.internalCount += 1;
+            }
+
+            // Path B: fallback network tile.
+            if (!texture) {
+              this.ensureFallbackTexture(v.z, v.x, v.y, v.key, gl);
+              texture = this.fallbackTextures.get(v.key) || null;
+              wrap = 0;
+              if (!texture) continue;
+              state.fallbackCount += 1;
+            }
+
+            const verts = mercatorVertsForTile(v.z, v.x, v.y, wrap);
+
+            gl.uniform1f(this.uZoom, v.z);
+            gl.uniform1f(this.uLat, latCenter);
+            gl.activeTexture(gl.TEXTURE0);
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.uniform1i(this.uDem, 0);
+
+            gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STREAM_DRAW);
+            gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+          }
+
+          updateStatus();
+        },
+
+        onRemove(_map, gl) {
+          for (const entry of this.fallbackTextures) {
+            gl.deleteTexture(entry[1]);
+          }
+          this.fallbackTextures.clear();
+          this.fallbackInFlight.clear();
+
+          if (this.buffer) gl.deleteBuffer(this.buffer);
+          if (this.program) gl.deleteProgram(this.program);
+        }
+      };
+    }
+
+    map.on('load', () => {
+      map.addLayer(createHybridLayer());
+    });
+
+    map.on('error', (e) => {
+      console.error('Map error:', e && e.error ? e.error.message : e);
+    });
+  </script>
+</body>
+</html>

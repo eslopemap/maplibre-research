@@ -1,0 +1,765 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Protocol-Raster DEM Slope / Aspect Overlay + emulated blend modes — MapLibre GL JS 6.18</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1,maximum-scale=1,user-scalable=no" />
+
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.18.0/dist/maplibre-gl.css" />
+
+  <style>
+    html, body, #map { margin: 0; width: 100%; height: 100%; }
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+
+    #controls {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      z-index: 10;
+      background: rgba(255, 255, 255, 0.92);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+      min-width: 220px;
+      font-size: 13px;
+    }
+
+    #legend {
+      position: absolute;
+      left: 10px;
+      bottom: 20px;
+      z-index: 10;
+      background: rgba(255, 255, 255, 0.92);
+      border-radius: 8px;
+      padding: 10px 12px;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.25);
+      min-width: 260px;
+      font-size: 12px;
+      line-height: 1.3;
+    }
+
+    .row { margin: 6px 0; }
+    .legend-title { font-weight: 700; margin-bottom: 6px; }
+    .ramp {
+      height: 12px;
+      border-radius: 4px;
+      border: 1px solid rgba(0,0,0,0.15);
+      margin: 6px 0 4px;
+    }
+    .labels { display: flex; justify-content: space-between; opacity: 0.85; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <div id="controls">
+    <div class="row">
+      <label for="mode"><strong>Mode</strong></label><br />
+      <select id="mode">
+        <option value="slope" selected>Slope</option>
+        <option value="aspect">Aspect</option>
+      </select>
+    </div>
+
+    <div class="row">
+      <label for="opacity"><strong>Opacity</strong>: <span id="opacityValue">0.35</span></label><br />
+      <input id="opacity" type="range" min="0" max="1" step="0.01" value="0.35" />
+    </div>
+
+    <div class="row">
+      <label for="blend"><strong>Blend</strong></label><br />
+      <select id="blend">
+        <optgroup label="Native (raster-layer-blend)">
+          <option value="normal" selected>normal</option>
+          <option value="multiply">multiply</option>
+          <option value="screen">screen</option>
+          <option value="overlay">overlay</option>
+          <option value="color">color</option>
+          <option value="luminosity">luminosity</option>
+          <option value="plus-lighter">plus-lighter</option>
+        </optgroup>
+        <optgroup label="Emulated (custom layer)">
+          <option value="darken">darken</option>
+          <option value="soft-light">soft-light</option>
+          <option value="multiply-linear">multiply (linear light)</option>
+          <option value="luma-multiply">multiply (luma-compensated)</option>
+        </optgroup>
+      </select>
+    </div>
+
+    <div class="row" style="opacity:0.75">
+      DEM: Terrarium tiles (Mapterhorn)
+    </div>
+  </div>
+
+  <div id="legend">
+    <div id="legendTitle" class="legend-title">Slope (degrees)</div>
+    <div id="legendRamp" class="ramp"></div>
+    <div id="legendLabels" class="labels"></div>
+  </div>
+
+  <script type="module">
+    import * as maplibregl from 'https://unpkg.com/maplibre-gl@6.18.0/dist/maplibre-gl.mjs';
+
+    // MapLibre 6.18 adds `raster-layer-blend`, but custom layers can't use it.
+    // So instead of a custom WebGL layer, slope/aspect tiles are rendered by the
+    // same Horn shader into an OffscreenCanvas behind a custom protocol, and
+    // displayed as a regular raster layer: MapLibre then handles tile management,
+    // opacity (`raster-opacity`) and compositing (`raster-layer-blend`).
+    //
+    // Blend modes that `raster-layer-blend` lacks (darken, soft-light, ...) need the
+    // backdrop pixel, so they are drawn by a custom layer instead: it copies the
+    // framebuffer into a texture once per frame, then draws the same analysis tiles
+    // with a shader that implements the W3C Compositing formulas.
+
+    const DEM_TILE_URL_TEMPLATE = 'https://tiles.mapterhorn.com/{z}/{x}/{y}.webp';
+    const PROTOCOL = 'dem-analysis';
+    const MAX_STEP_STOPS = 16;
+    const DEM_MAX_Z = 14;
+    const TILE_SIZE = 512;
+
+    const ANALYSIS_COLOR = {
+      slope: [
+        'step', ['slope'],
+        'green',
+        15, 'yellow',
+        30, 'orange',
+        45, 'red'
+      ],
+      aspect: [
+        'step', ['aspect'],
+        '#ff0000',
+        45, '#ffff00',
+        135, '#00ff00',
+        225, '#00ffff',
+        315, '#0000ff'
+      ]
+    };
+
+    const ANALYSIS_RANGE = {
+      slope: [0, 90],
+      aspect: [0, 360]
+    };
+
+    const colorCanvas = document.createElement('canvas');
+    colorCanvas.width = 1;
+    colorCanvas.height = 1;
+    const colorCtx = colorCanvas.getContext('2d', {willReadFrequently: true});
+
+    function demTileUrl(z, x, y) {
+      return DEM_TILE_URL_TEMPLATE
+        .replace('{z}', String(z))
+        .replace('{x}', String(x))
+        .replace('{y}', String(y));
+    }
+
+    function cssColorToRgb01(color) {
+      colorCtx.clearRect(0, 0, 1, 1);
+      colorCtx.fillStyle = '#000000';
+      colorCtx.fillStyle = color;
+      colorCtx.fillRect(0, 0, 1, 1);
+      const pixel = colorCtx.getImageData(0, 0, 1, 1).data;
+      return [pixel[0] / 255, pixel[1] / 255, pixel[2] / 255];
+    }
+
+    function parseStepRamp(expression, expectedInput) {
+      if (!Array.isArray(expression) || expression[0] !== 'step') {
+        throw new Error('Color expression must be a step expression');
+      }
+
+      const input = expression[1];
+      if (!Array.isArray(input) || input[0] !== expectedInput) {
+        throw new Error(`Step input must be ["${expectedInput}"]`);
+      }
+
+      const defaultColor = expression[2];
+      const stepCount = Math.floor((expression.length - 3) / 2);
+      if (stepCount > MAX_STEP_STOPS) {
+        throw new Error(`Too many step stops. Max supported is ${MAX_STEP_STOPS}`);
+      }
+
+      const values = new Float32Array(MAX_STEP_STOPS);
+      const colors = new Float32Array((MAX_STEP_STOPS + 1) * 3);
+
+      const c0 = cssColorToRgb01(defaultColor);
+      colors[0] = c0[0];
+      colors[1] = c0[1];
+      colors[2] = c0[2];
+
+      for (let i = 0; i < stepCount; i++) {
+        values[i] = Number(expression[3 + i * 2]);
+        const c = cssColorToRgb01(expression[4 + i * 2]);
+        colors[(i + 1) * 3 + 0] = c[0];
+        colors[(i + 1) * 3 + 1] = c[1];
+        colors[(i + 1) * 3 + 2] = c[2];
+      }
+
+      return {stepCount, values, colors};
+    }
+
+    const PARSED_RAMPS = {
+      slope: parseStepRamp(ANALYSIS_COLOR.slope, 'slope'),
+      aspect: parseStepRamp(ANALYSIS_COLOR.aspect, 'aspect')
+    };
+
+    function rampToLegendCss(mode) {
+      const ramp = PARSED_RAMPS[mode];
+      const [min, max] = ANALYSIS_RANGE[mode];
+      const parts = [];
+
+      for (let i = 0; i <= ramp.stepCount; i++) {
+        const r = Math.round(ramp.colors[i * 3 + 0] * 255);
+        const g = Math.round(ramp.colors[i * 3 + 1] * 255);
+        const b = Math.round(ramp.colors[i * 3 + 2] * 255);
+        const percent = i === 0 ? 0 :
+          Math.max(0, Math.min(100, ((ramp.values[i - 1] - min) / (max - min)) * 100));
+        parts.push(`rgb(${r}, ${g}, ${b}) ${percent.toFixed(2)}%`);
+      }
+
+      return `linear-gradient(to right, ${parts.join(', ')})`;
+    }
+
+    function tileCenterLat(y, z) {
+      const n = Math.pow(2, z);
+      const northRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * y / n)));
+      const southRad = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 1) / n)));
+      return (northRad + southRad) * 0.5 * 180 / Math.PI;
+    }
+
+    /**
+     * Offscreen WebGL renderer turning one Terrarium DEM tile into an opaque
+     * slope/aspect color tile. Opacity and blending are left to the raster layer.
+     */
+    function createAnalysisRenderer() {
+      const canvas = new OffscreenCanvas(TILE_SIZE, TILE_SIZE);
+      const gl = canvas.getContext('webgl', {premultipliedAlpha: false, antialias: false});
+      if (!gl) throw new Error('WebGL not available in OffscreenCanvas');
+
+      const vertexSource = `
+        precision highp float;
+        attribute vec2 a_pos;
+        varying vec2 v_uv;
+        void main() {
+          // Clip-space y=+1 is the top of the output image, i.e. DEM texture row 0.
+          v_uv = vec2(a_pos.x + 1.0, 1.0 - a_pos.y) * 0.5;
+          gl_Position = vec4(a_pos, 0.0, 1.0);
+        }
+      `;
+
+      const fragmentSource = `
+        precision highp float;
+        uniform sampler2D u_dem;
+        uniform int u_mode;
+        uniform float u_zoom;
+        uniform float u_lat;
+        uniform vec2 u_texel;
+        uniform int u_step_count;
+        uniform float u_step_values[${MAX_STEP_STOPS}];
+        uniform vec3 u_step_colors[${MAX_STEP_STOPS + 1}];
+        varying vec2 v_uv;
+
+        float decodeTerrarium(vec4 c) {
+          float r = c.r * 255.0;
+          float g = c.g * 255.0;
+          float b = c.b * 255.0;
+          return (r * 256.0 + g + b / 256.0) - 32768.0;
+        }
+
+        float elevationAt(vec2 uv) {
+          vec2 clamped = clamp(uv, vec2(0.0), vec2(1.0));
+          return decodeTerrarium(texture2D(u_dem, clamped));
+        }
+
+        vec2 hornDeriv(vec2 uv) {
+          vec2 e = u_texel;
+
+          float a = elevationAt(uv + vec2(-e.x, -e.y));
+          float b = elevationAt(uv + vec2(0.0, -e.y));
+          float c = elevationAt(uv + vec2(e.x, -e.y));
+          float d = elevationAt(uv + vec2(-e.x, 0.0));
+          float f = elevationAt(uv + vec2(e.x, 0.0));
+          float g = elevationAt(uv + vec2(-e.x, e.y));
+          float h = elevationAt(uv + vec2(0.0, e.y));
+          float i = elevationAt(uv + vec2(e.x, e.y));
+
+          float dzdx = (c + 2.0 * f + i) - (a + 2.0 * d + g);
+          float dzdy = (g + 2.0 * h + i) - (a + 2.0 * b + c);
+
+          float tileSize = 510.0;
+          vec2 deriv = vec2(dzdx, dzdy) * tileSize / pow(2.0, 28.2562 - u_zoom);
+          deriv.x = deriv.x / max(cos(radians(u_lat)), 0.0001);
+          return deriv;
+        }
+
+        vec3 colorFromStep(float value) {
+          vec3 color = u_step_colors[0];
+          for (int i = 0; i < ${MAX_STEP_STOPS}; i++) {
+            if (i >= u_step_count) break;
+            if (value >= u_step_values[i]) {
+              color = u_step_colors[i + 1];
+            }
+          }
+          return color;
+        }
+
+        void main() {
+          vec2 d = hornDeriv(v_uv);
+          float gradient = length(d);
+          float slopeDeg = clamp(degrees(atan(gradient)), 0.0, 90.0);
+
+          float aspectDeg = degrees(atan(d.y, -d.x));
+          aspectDeg = mod(90.0 - aspectDeg, 360.0);
+          if (gradient < 0.0001) aspectDeg = 0.0;
+
+          float scalar = (u_mode == 0) ? slopeDeg : aspectDeg;
+          gl_FragColor = vec4(colorFromStep(scalar), 1.0);
+        }
+      `;
+
+      function compile(type, source) {
+        const shader = gl.createShader(type);
+        gl.shaderSource(shader, source);
+        gl.compileShader(shader);
+        if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+          throw new Error(gl.getShaderInfoLog(shader) || 'Shader compile failed');
+        }
+        return shader;
+      }
+
+      const program = gl.createProgram();
+      gl.attachShader(program, compile(gl.VERTEX_SHADER, vertexSource));
+      gl.attachShader(program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+      gl.linkProgram(program);
+      if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
+        throw new Error(gl.getProgramInfoLog(program) || 'Program link failed');
+      }
+      gl.useProgram(program);
+
+      const u = (name) => gl.getUniformLocation(program, name);
+      const uMode = u('u_mode');
+      const uZoom = u('u_zoom');
+      const uLat = u('u_lat');
+      const uStepCount = u('u_step_count');
+      const uStepValues = u('u_step_values');
+      const uStepColors = u('u_step_colors');
+      gl.uniform1i(u('u_dem'), 0);
+      gl.uniform2f(u('u_texel'), 1 / TILE_SIZE, 1 / TILE_SIZE);
+
+      gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+      gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+      const aPos = gl.getAttribLocation(program, 'a_pos');
+      gl.enableVertexAttribArray(aPos);
+      gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+      const texture = gl.createTexture();
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, texture);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+      gl.pixelStorei(gl.UNPACK_COLORSPACE_CONVERSION_WEBGL, gl.NONE);
+      gl.viewport(0, 0, TILE_SIZE, TILE_SIZE);
+
+      /** Render a decoded DEM tile to an ImageBitmap (synchronous, so the shared context is safe). */
+      return function render(demBitmap, mode, z, y) {
+        const ramp = PARSED_RAMPS[mode];
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, demBitmap);
+        gl.uniform1i(uMode, mode === 'slope' ? 0 : 1);
+        gl.uniform1f(uZoom, z);
+        gl.uniform1f(uLat, tileCenterLat(y, z));
+        gl.uniform1i(uStepCount, ramp.stepCount);
+        gl.uniform1fv(uStepValues, ramp.values);
+        gl.uniform3fv(uStepColors, ramp.colors);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+        return canvas.transferToImageBitmap();
+      };
+    }
+
+    const renderAnalysisTile = createAnalysisRenderer();
+
+    /** Fetch a DEM tile and render it to an opaque slope/aspect color ImageBitmap. */
+    async function loadAnalysisTile(mode, z, x, y, signal) {
+      const response = await fetch(demTileUrl(z, x, y), {mode: 'cors', cache: 'force-cache', signal});
+      if (!response.ok) throw new Error(`DEM tile ${z}/${x}/${y}: HTTP ${response.status}`);
+      const dem = await createImageBitmap(await response.blob(), {premultiplyAlpha: 'none', colorSpaceConversion: 'none'});
+      try {
+        return renderAnalysisTile(dem, mode, z, y);
+      } finally {
+        dem.close();
+      }
+    }
+
+    // URL shape: dem-analysis://<mode>/<z>/<x>/<y>
+    maplibregl.addProtocol(PROTOCOL, async (params, abortController) => {
+      const [mode, z, x, y] = params.url.slice(`${PROTOCOL}://`.length).split('/');
+      return {data: await loadAnalysisTile(mode, Number(z), Number(x), Number(y), abortController.signal)};
+    });
+
+    // Shader ids of the blend modes emulated by the custom layer.
+    const EMULATED_BLENDS = {'darken': 1, 'soft-light': 2, 'multiply-linear': 3, 'luma-multiply': 4};
+    const MAX_CACHED_TILES = 300;
+    const MAX_PARENT_FALLBACK = 4;
+
+    /**
+     * Custom layer drawing the analysis tiles with blend modes that need the backdrop.
+     * Tiles come from `map.coveringTiles()` + `loadAnalysisTile()`; while a tile loads,
+     * the matching quarter of a loaded ancestor is drawn instead.
+     */
+    function createEmulatedBlendLayer() {
+      return {
+        id: 'dem-analysis-emulated',
+        type: 'custom',
+        renderingMode: '2d',
+        tiles: new Map(), // key -> {ac} (loading) | {bitmap} (loaded, not uploaded) | {texture, used} | {failed}
+        frame: 0,
+        backdropSize: [0, 0],
+
+        onAdd(map, gl) {
+          this.map = map;
+          this.gl = gl;
+
+          const vertexSource = `#version 300 es
+            precision highp float;
+            uniform mat4 u_matrix;
+            uniform vec4 u_tile;   // mercator x, y, width, height
+            uniform vec3 u_uv;     // uv offset x, y, scale (parent fallback)
+            in vec2 a_pos;
+            out vec2 v_uv;
+            void main() {
+              v_uv = u_uv.xy + a_pos * u_uv.z;
+              gl_Position = u_matrix * vec4(u_tile.xy + a_pos * u_tile.zw, 0.0, 1.0);
+            }
+          `;
+
+          const fragmentSource = `#version 300 es
+            precision highp float;
+            uniform sampler2D u_color;
+            uniform sampler2D u_backdrop;
+            uniform float u_opacity;
+            uniform int u_blend;
+            in vec2 v_uv;
+            out vec4 fragColor;
+
+            vec3 toLinear(vec3 c) { return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c)); }
+            vec3 toSrgb(vec3 c) { return mix(c * 12.92, 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055, step(0.0031308, c)); }
+
+            // W3C Compositing-1 non-separable helpers.
+            float lum(vec3 c) { return dot(c, vec3(0.3, 0.59, 0.11)); }
+            vec3 clipColor(vec3 c) {
+              float l = lum(c);
+              float n = min(min(c.r, c.g), c.b);
+              float x = max(max(c.r, c.g), c.b);
+              if (n < 0.0) c = l + (c - l) * l / (l - n);
+              if (x > 1.0) c = l + (c - l) * (1.0 - l) / (x - l);
+              return c;
+            }
+            vec3 setLum(vec3 c, float l) { return clipColor(c + (l - lum(c))); }
+
+            vec3 softLight(vec3 cb, vec3 cs) {
+              vec3 d = mix(sqrt(cb), ((16.0 * cb - 12.0) * cb + 4.0) * cb, step(cb, vec3(0.25)));
+              return mix(cb + (2.0 * cs - 1.0) * (d - cb), cb - (1.0 - 2.0 * cs) * cb * (1.0 - cb), step(cs, vec3(0.5)));
+            }
+
+            // Source-over of an (unpremultiplied) source with alpha a, using blend result B
+            // where the backdrop is covered (W3C: Cs' = (1 - ab) Cs + ab B). Returns premultiplied.
+            vec4 composite(vec3 cs, vec3 cb, float ab, vec3 B, float a) {
+              return vec4(a * (1.0 - ab) * cs + a * ab * B + (1.0 - a) * ab * cb, a + ab * (1.0 - a));
+            }
+
+            void main() {
+              vec3 cs = texture(u_color, v_uv).rgb;
+              vec4 bd = texelFetch(u_backdrop, ivec2(gl_FragCoord.xy), 0);
+              float ab = bd.a;
+              vec3 cb = ab > 0.0 ? bd.rgb / ab : vec3(0.0);
+              float a = u_opacity;
+
+              if (u_blend == 3) {
+                // Multiply and opacity mix in linear light: avoids the sRGB darkening at mid opacity.
+                vec3 ls = toLinear(cs);
+                vec3 lb = toLinear(cb);
+                vec4 r = composite(ls, lb, ab, ls * lb, a);
+                fragColor = r.a > 0.0 ? vec4(toSrgb(r.rgb / r.a) * r.a, r.a) : vec4(0.0);
+                return;
+              }
+
+              vec3 B;
+              if (u_blend == 1) B = min(cb, cs);
+              else if (u_blend == 2) B = softLight(cb, cs);
+              else B = setLum(cs * cb, lum(cb)); // multiply tint, backdrop luminance kept
+              fragColor = composite(cs, cb, ab, B, a);
+            }
+          `;
+
+          const compile = (type, source) => {
+            const shader = gl.createShader(type);
+            gl.shaderSource(shader, source);
+            gl.compileShader(shader);
+            if (!gl.getShaderParameter(shader, gl.COMPILE_STATUS)) {
+              throw new Error(gl.getShaderInfoLog(shader) || 'Shader compile failed');
+            }
+            return shader;
+          };
+
+          this.program = gl.createProgram();
+          gl.attachShader(this.program, compile(gl.VERTEX_SHADER, vertexSource));
+          gl.attachShader(this.program, compile(gl.FRAGMENT_SHADER, fragmentSource));
+          gl.linkProgram(this.program);
+          if (!gl.getProgramParameter(this.program, gl.LINK_STATUS)) {
+            throw new Error(gl.getProgramInfoLog(this.program) || 'Program link failed');
+          }
+
+          this.loc = {};
+          for (const name of ['u_matrix', 'u_tile', 'u_uv', 'u_color', 'u_backdrop', 'u_opacity', 'u_blend']) {
+            this.loc[name] = gl.getUniformLocation(this.program, name);
+          }
+          this.aPos = gl.getAttribLocation(this.program, 'a_pos');
+
+          this.buffer = gl.createBuffer();
+          gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+          gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([0, 0, 0, 1, 1, 0, 1, 1]), gl.STATIC_DRAW);
+
+          this.backdrop = gl.createTexture();
+        },
+
+        /** Drop all tiles, e.g. after an analysis mode change. */
+        reset() {
+          for (const tile of this.tiles.values()) {
+            if (tile.ac) tile.ac.abort();
+            if (tile.bitmap) tile.bitmap.close();
+            if (tile.texture) this.gl.deleteTexture(tile.texture);
+          }
+          this.tiles.clear();
+          this.map.triggerRepaint();
+        },
+
+        requestTile(z, x, y, key) {
+          const ac = new AbortController();
+          this.tiles.set(key, {ac});
+          loadAnalysisTile(state.mode, z, x, y, ac.signal).then((bitmap) => {
+            if (this.tiles.get(key)?.ac !== ac) return bitmap.close();
+            // GL upload is deferred to render(), where MapLibre expects its GL state to be touched.
+            this.tiles.set(key, {bitmap});
+            this.map.triggerRepaint();
+          }).catch((err) => {
+            if (err.name === 'AbortError' || this.tiles.get(key)?.ac !== ac) return;
+            console.error('Analysis tile failed:', key, err);
+            this.tiles.set(key, {failed: true});
+          });
+        },
+
+        uploadTexture(gl, tile) {
+          const texture = gl.createTexture();
+          gl.bindTexture(gl.TEXTURE_2D, texture);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+          gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+          gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
+          gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+          gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, tile.bitmap);
+          tile.bitmap.close();
+          delete tile.bitmap;
+          tile.texture = texture;
+        },
+
+        /** Texture for tile z/x/y, or the matching sub-rect of the closest loaded ancestor. */
+        findTexture(gl, z, x, y) {
+          for (let dz = 0; dz <= Math.min(MAX_PARENT_FALLBACK, z); dz++) {
+            const pz = z - dz, px = x >> dz, py = y >> dz;
+            const tile = this.tiles.get(`${pz}/${px}/${py}`);
+            if (!tile) continue;
+            if (tile.bitmap) this.uploadTexture(gl, tile);
+            if (!tile.texture) continue;
+            tile.used = this.frame;
+            const scale = 1 / (1 << dz);
+            return {texture: tile.texture, uv: [(x - (px << dz)) * scale, (y - (py << dz)) * scale, scale]};
+          }
+          return null;
+        },
+
+        copyBackdrop(gl) {
+          const [vx, vy, w, h] = gl.getParameter(gl.VIEWPORT);
+          gl.activeTexture(gl.TEXTURE1);
+          gl.bindTexture(gl.TEXTURE_2D, this.backdrop);
+          if (this.backdropSize[0] !== w || this.backdropSize[1] !== h) {
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+            this.backdropSize = [w, h];
+          }
+          gl.copyTexSubImage2D(gl.TEXTURE_2D, 0, 0, 0, vx, vy, w, h);
+        },
+
+        evictTiles(gl) {
+          if (this.tiles.size <= MAX_CACHED_TILES) return;
+          const stale = [...this.tiles].filter(([, t]) => t.texture && t.used < this.frame)
+            .sort((a, b) => a[1].used - b[1].used);
+          for (const [key, tile] of stale.slice(0, this.tiles.size - MAX_CACHED_TILES)) {
+            gl.deleteTexture(tile.texture);
+            this.tiles.delete(key);
+          }
+        },
+
+        render(gl, args) {
+          const blendId = EMULATED_BLENDS[state.blend];
+          if (!blendId) return;
+          this.frame++;
+
+          const draws = [];
+          const seen = new Set();
+          for (const id of this.map.coveringTiles({tileSize: TILE_SIZE, maxzoom: DEM_MAX_Z})) {
+            const {z, x, y} = id.canonical;
+            const drawKey = `${id.wrap}/${z}/${x}/${y}`;
+            if (seen.has(drawKey)) continue;
+            seen.add(drawKey);
+            const key = `${z}/${x}/${y}`;
+            if (!this.tiles.has(key)) this.requestTile(z, x, y, key);
+            const found = this.findTexture(gl, z, x, y);
+            if (found) draws.push({...found, z, x, y, wrap: id.wrap});
+          }
+
+          if (draws.length) {
+            this.copyBackdrop(gl);
+
+            gl.useProgram(this.program);
+            gl.uniformMatrix4fv(this.loc.u_matrix, false, args.defaultProjectionData.mainMatrix);
+            gl.uniform1f(this.loc.u_opacity, state.opacity);
+            gl.uniform1i(this.loc.u_blend, blendId);
+            gl.uniform1i(this.loc.u_color, 0);
+            gl.uniform1i(this.loc.u_backdrop, 1);
+
+            gl.bindBuffer(gl.ARRAY_BUFFER, this.buffer);
+            gl.enableVertexAttribArray(this.aPos);
+            gl.vertexAttribPointer(this.aPos, 2, gl.FLOAT, false, 0, 0);
+            // The shader computes the final composited color itself.
+            gl.disable(gl.BLEND);
+
+            gl.activeTexture(gl.TEXTURE0);
+            for (const d of draws) {
+              const size = 1 / (1 << d.z);
+              gl.bindTexture(gl.TEXTURE_2D, d.texture);
+              gl.uniform4f(this.loc.u_tile, d.x * size + d.wrap, d.y * size, size, size);
+              gl.uniform3f(this.loc.u_uv, d.uv[0], d.uv[1], d.uv[2]);
+              gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+            }
+          }
+
+          this.evictTiles(gl);
+        },
+
+        onRemove(_map, gl) {
+          this.reset();
+          gl.deleteTexture(this.backdrop);
+          gl.deleteBuffer(this.buffer);
+          gl.deleteProgram(this.program);
+        }
+      };
+    }
+
+    const emulatedLayer = createEmulatedBlendLayer();
+
+    const analysisTiles = (mode) => [`${PROTOCOL}://${mode}/{z}/{x}/{y}`];
+
+    const state = {mode: 'slope', opacity: 0.35, blend: 'normal'};
+
+    const map = new maplibregl.Map({
+      container: 'map',
+      center: [6.8652, 45.8326],
+      zoom: 12,
+      style: {
+        version: 8,
+        sources: {
+          osm: {
+            type: 'raster',
+            tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
+            tileSize: 512,
+            attribution: '&copy; OpenStreetMap contributors'
+          },
+          'dem-analysis': {
+            type: 'raster',
+            tiles: analysisTiles(state.mode),
+            tileSize: TILE_SIZE,
+            maxzoom: DEM_MAX_Z,
+            attribution: '<a href="https://mapterhorn.com">Mapterhorn</a>'
+          }
+        },
+        layers: [
+          {id: 'osm', type: 'raster', source: 'osm', paint: {'raster-opacity': 1}},
+          {
+            id: 'dem-analysis',
+            type: 'raster',
+            source: 'dem-analysis',
+            paint: {
+              'raster-opacity': state.opacity,
+              'raster-layer-blend': state.blend,
+              'raster-fade-duration': 0
+            }
+          }
+        ]
+      },
+      canvasContextAttributes: {antialias: true}
+    });
+    window.map = map;
+
+    map.on('load', () => {
+      map.addLayer(emulatedLayer);
+      applyBlend();
+    });
+
+    /** Route the overlay to the native raster layer or the emulating custom layer. */
+    function applyBlend() {
+      const emulated = state.blend in EMULATED_BLENDS;
+      map.setLayoutProperty('dem-analysis', 'visibility', emulated ? 'none' : 'visible');
+      if (!emulated) map.setPaintProperty('dem-analysis', 'raster-layer-blend', state.blend);
+      map.triggerRepaint();
+    }
+
+    const modeEl = document.getElementById('mode');
+    const opacityEl = document.getElementById('opacity');
+    const opacityValueEl = document.getElementById('opacityValue');
+    const blendEl = document.getElementById('blend');
+
+    modeEl.addEventListener('change', () => {
+      state.mode = modeEl.value;
+      updateLegend();
+      map.getSource('dem-analysis').setTiles(analysisTiles(state.mode));
+      emulatedLayer.reset();
+    });
+
+    opacityEl.addEventListener('input', () => {
+      state.opacity = Number(opacityEl.value);
+      opacityValueEl.textContent = state.opacity.toFixed(2);
+      map.setPaintProperty('dem-analysis', 'raster-opacity', state.opacity);
+      map.triggerRepaint();
+    });
+
+    blendEl.addEventListener('change', () => {
+      state.blend = blendEl.value;
+      applyBlend();
+    });
+
+    function updateLegend() {
+      const title = document.getElementById('legendTitle');
+      const ramp = document.getElementById('legendRamp');
+      const labels = document.getElementById('legendLabels');
+
+      if (state.mode === 'slope') {
+        title.textContent = 'Slope (degrees)';
+        ramp.style.background = rampToLegendCss('slope');
+        labels.innerHTML = '<span>0°</span><span>15°</span><span>30°</span><span>45°</span><span>90°</span>';
+      } else {
+        title.textContent = 'Aspect (compass direction)';
+        ramp.style.background = rampToLegendCss('aspect');
+        labels.innerHTML = '<span>N</span><span>E</span><span>S</span><span>W</span><span>N</span>';
+      }
+    }
+    updateLegend();
+
+    map.on('error', (e) => {
+      console.error('Map error:', e && e.error ? e.error.message : e);
+    });
+  </script>
+</body>
+</html>

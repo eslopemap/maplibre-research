@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.19.0/dist/maplibre-gl.css" />
+  <script src="https://unpkg.com/maplibre-gl@5.19.0/dist/maplibre-gl.js"></script>
+  <style>
+    body { margin: 0; }
+    #map { width: 100%; height: 100vh; }
+    #panel { position: absolute; top: 10px; left: 10px; z-index: 10;
+             background: white; padding: 12px; border-radius: 8px; }
+  </style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <button onclick="activate('track1')">Activate</button>
+  <button onclick="activate('none')">Deactivate</button>
+  <p><b>Working</b> (paint-only, top row)</p>
+  <p><b>Broken</b> (filter, bottom row)</p>
+  <p><b>Expression-native</b> (proper filter syntax, third row)</p>
+</div>
+<script>
+const map = new maplibregl.Map({
+  container: 'map', center: [0, 10], zoom: 2,
+  style: { version: 8,
+    sources: { osm: { type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256 } },
+    layers: [{ id: 'osm', type: 'raster', source: 'osm' }] }
+});
+
+const geojson = {
+  type: 'FeatureCollection',
+  features: [
+    { type: 'Feature', geometry: { type: 'Point', coordinates: [-20, 0] },
+      properties: { id: 'track1', role: 'start' } },
+    { type: 'Feature', geometry: { type: 'Point', coordinates: [0, 0] },
+      properties: { id: 'track1', role: 'mid' } },
+    { type: 'Feature', geometry: { type: 'Point', coordinates: [20, 0] },
+      properties: { id: 'track1', role: 'end' } }
+  ]
+};
+
+const isActive = ['==', ['get', 'id'], ['global-state', 'activeId']];
+const isStartOrEnd = ['any', ['==', ['get', 'role'], 'start'], ['==', ['get', 'role'], 'end']];
+
+function activate(id) {
+  map.setGlobalStateProperty('activeId', id);
+}
+
+map.on('load', () => {
+  // WORKING: global-state in paint only
+  map.addSource('working', { type: 'geojson', data: geojson });
+  map.addLayer({
+    id: 'working-pts', type: 'circle', source: 'working',
+    filter: ['==', '$type', 'Point'],
+    paint: {
+      // Active: all points. Inactive: only start/end.
+      'circle-radius': ['case', isActive, 6, isStartOrEnd, 6, 0],
+      'circle-color': 'green'
+    }
+  });
+
+  // BROKEN MIXED: global-state in filter
+  map.addSource('broken', { type: 'geojson',
+    data: { type: 'FeatureCollection', features: geojson.features.map(f => ({
+      ...f, geometry: { ...f.geometry, coordinates: [f.geometry.coordinates[0], -20] }
+    }))}
+  });
+  map.addLayer({
+    id: 'broken-pts', type: 'circle', source: 'broken',
+    // This mixed filter should behave like working-pts semantics,
+    // but currently fails due to expression/legacy classification.
+    filter: ['all',
+      ['==', '$type', 'Point'],
+      ['case', isActive, true, isStartOrEnd]
+    ],
+    paint: {
+      'circle-radius': 6,
+      'circle-color': 'red'
+    }
+  });
+
+  // WORKING MODERN: what I should have done instead
+  map.addSource('fixed', { type: 'geojson',
+    data: { type: 'FeatureCollection', features: geojson.features.map(f => ({
+      ...f, geometry: { ...f.geometry, coordinates: [f.geometry.coordinates[0], -40] }
+    }))}
+  });
+  map.addLayer({
+    id: 'fixed-pts', type: 'circle', source: 'fixed',
+    filter: ['all',
+      ['==', ['geometry-type'], 'Point'],
+      ['case', isActive, true, isStartOrEnd]
+    ],
+    paint: {
+      'circle-radius': 6,
+      'circle-color': 'blue'
+    }
+  });
+
+  activate('none');
+});
+</script>
+</body>
+</html>
