@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>MapLibre 6.18: raster-layer-blend lost under terrain after a non-drapable layer</title>
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@6.18.0/dist/maplibre-gl.css" />
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; }
+    body { display: grid; grid-template: auto 1fr / 1fr 1fr; }
+    p { grid-column: 1 / 3; margin: 8px; font-size: 14px; }
+    h3 { position: absolute; z-index: 1; margin: 8px; padding: 4px 8px; background: #fffd; }
+    .map { position: relative; }
+  </style>
+</head>
+<body>
+  <p>
+    Same style on both sides: yellow <code>background</code>, then OSM <code>raster</code> with
+    <code>raster-layer-blend: multiply</code>, with 3D terrain on.<br>
+    <b>Left:</b> OSM is tinted yellow, so multiply works.
+    <b>Right:</b> the only change is a <code>circle</code> layer between the two. The circle
+    layer is not draped, so it splits the terrain render-to-texture stack. The raster then
+    blends into an empty tile texture (transparent backdrop) and multiply falls back to normal.
+    You get plain OSM with no yellow tint.
+  </p>
+  <div class="map" id="left"><h3>background → raster (multiply)</h3></div>
+  <div class="map" id="right"><h3>background → circle → raster (multiply)</h3></div>
+
+  <script type="module">
+    import * as maplibregl from 'https://unpkg.com/maplibre-gl@6.18.0/dist/maplibre-gl.mjs';
+
+    const center = [6.8652, 45.8326];
+
+    function makeMap(container, withCircle) {
+      const layers = [
+        {id: 'bg', type: 'background', paint: {'background-color': '#ffd400'}},
+        withCircle && {id: 'dot', type: 'circle', source: 'dot', paint: {'circle-radius': 8, 'circle-color': '#f00'}},
+        {id: 'osm', type: 'raster', source: 'osm', paint: {'raster-layer-blend': 'multiply', 'raster-fade-duration': 0}}
+      ].filter(Boolean);
+
+      return new maplibregl.Map({
+        container, center, zoom: 12, pitch: 60,
+        style: {
+          version: 8,
+          sources: {
+            osm: {type: 'raster', tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'], tileSize: 256,
+                  attribution: '&copy; OpenStreetMap contributors'},
+            dem: {type: 'raster-dem', tiles: ['https://tiles.mapterhorn.com/{z}/{x}/{y}.webp'], encoding: 'terrarium',
+                  tileSize: 512, maxzoom: 14, attribution: '<a href="https://mapterhorn.com">Mapterhorn</a>'},
+            dot: {type: 'geojson', data: {type: 'Point', coordinates: center}}
+          },
+          terrain: {source: 'dem', exaggeration: 1.5},
+          layers
+        }
+      });
+    }
+
+    const left = makeMap('left', false);
+    const right = makeMap('right', true);
+    // Keep both cameras in sync so the two sides are easy to compare.
+    left.on('move', () => right.jumpTo({center: left.getCenter(), zoom: left.getZoom(), bearing: left.getBearing(), pitch: left.getPitch()}));
+  </script>
+</body>
+</html>
